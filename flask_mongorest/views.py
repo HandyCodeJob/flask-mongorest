@@ -5,22 +5,34 @@ import mongoengine
 from flask import request, render_template
 from werkzeug.exceptions import NotFound, Unauthorized
 
-from flask.ext.mongorest.exceptions import ValidationError
-from flask.ext.mongorest.utils import MongoEncoder
-from flask.ext.mongorest import methods
-from flask.ext.views.base import View
+from flask_mongorest.exceptions import ValidationError
+from flask_mongorest.utils import MongoEncoder
+from flask_mongorest import methods
+from flask_views.base import View
 
 mimerender = mimerender.FlaskMimeRender()
 
 render_json = lambda **payload: json.dumps(payload, allow_nan=False, cls=MongoEncoder)
 render_html = lambda **payload: render_template('mongorest/debug.html', data=json.dumps(payload, cls=MongoEncoder, sort_keys=True, indent=4))
 
+try:
+    text_type = unicode # Python 2
+except NameError:
+    text_type = str # Python 3
+
 def serialize_mongoengine_validation_error(e):
-    def serialize_errors(errors):
-        if hasattr(errors, 'iteritems'):
-            return dict((k, serialize_errors(v)) for (k, v) in errors.iteritems())
+    """
+    Takes a MongoEngine ValidationError as an argument, and returns a
+    serializable error dict. Note that we can have nested ValidationErrors.
+    """
+
+    def serialize_errors(e):
+        if getattr(e, 'message', None):
+            return e.message
+        elif hasattr(e, 'items'):
+            return dict((k, serialize_errors(v)) for (k, v) in e.items())
         else:
-            return unicode(errors)
+            return text_type(e)
 
     if e.errors:
         return {'field-errors': serialize_errors(e.errors)}
@@ -61,7 +73,7 @@ class ResourceView(View):
         except Unauthorized as e:
             return {'error': 'Unauthorized'}, '401 Unauthorized'
         except NotFound as e:
-            return {'error': unicode(e)}, '404 Not Found'
+            return {'error': str(e)}, '404 Not Found'
 
     def handle_validation_error(self, e):
         if isinstance(e, ValidationError):
@@ -138,7 +150,7 @@ class ResourceView(View):
         self._resource.validate_request()
         try:
             obj = self._resource.create_object()
-        except Exception, e:
+        except Exception as e:
             self.handle_validation_error(e)
 
         # Check if we have permission to create this object
@@ -161,7 +173,7 @@ class ResourceView(View):
 
         try:
             obj = self._resource.update_object(obj)
-        except Exception, e:
+        except Exception as e:
             self.handle_validation_error(e)
 
     def process_objects(self, objs):
@@ -174,7 +186,7 @@ class ResourceView(View):
             for obj in objs:
                 self.process_object(obj)
                 count += 1
-        except ValidationError, e:
+        except ValidationError as e:
             e.message['count'] = count
             raise e
         else:

@@ -1,13 +1,13 @@
 import os
 
 from flask import Flask, request
-from flask.ext.mongoengine import MongoEngine
-from flask.ext.mongorest import MongoRest
-from flask.ext.mongorest.views import ResourceView
-from flask.ext.mongorest.resources import Resource
-from flask.ext.mongorest import operators as ops
-from flask.ext.mongorest.methods import Create, Update, Fetch, List, Delete, BulkUpdate
-from flask.ext.mongorest.authentication import AuthenticationBase
+from flask_mongoengine import MongoEngine
+from flask_mongorest import MongoRest
+from flask_mongorest.views import ResourceView
+from flask_mongorest.resources import Resource
+from flask_mongorest import operators as ops
+from flask_mongorest.methods import *
+from flask_mongorest.authentication import AuthenticationBase
 
 from example import schemas, documents
 
@@ -23,7 +23,7 @@ app.config.update(
         'HOST': 'localhost',
         'PORT': 27017,
         'DB': 'mongorest_example_app',
-        'TZ_AWARE': True,
+        'TZ_AWARE': False,
     },
 )
 
@@ -138,6 +138,7 @@ class TestDocument(db.Document):
     other = db.StringField()
     dictfield = db.DictField()
     is_new = db.BooleanField()
+    email = db.EmailField()
 
 class TestResource(Resource):
     document = TestDocument

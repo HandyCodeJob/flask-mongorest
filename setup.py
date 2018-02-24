@@ -9,7 +9,7 @@ except:
 
 setup(
     name='Flask-MongoRest',
-    version='0.1.1',
+    version='0.2.3',
     url='http://github.com/closeio/flask-mongorest',
     license='BSD',
     author='Close.io',
@@ -32,7 +32,6 @@ setup(
         'Flask-MongoEngine',
         'mimerender',
         'nose',
-        'coverage',
         'python-dateutil',
         'cleancat'
     ],

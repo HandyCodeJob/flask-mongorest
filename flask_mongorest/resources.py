@@ -4,28 +4,36 @@ import mongoengine
 from bson.dbref import DBRef
 from bson.objectid import ObjectId
 from flask import request, url_for
-from urlparse import urlparse
-from mongoengine.base.proxy import DocumentProxy
-from mongoengine.fields import EmbeddedDocumentField, ListField, ReferenceField, GenericReferenceField, SafeReferenceField
+try:
+    from urllib.parse import urlparse
+except ImportError: # Python 2
+    from urlparse import urlparse
+
+try: # closeio/mongoengine
+    from mongoengine.base.proxy import DocumentProxy
+    from mongoengine.fields import SafeReferenceField
+except ImportError:
+    DocumentProxy = None
+    SafeReferenceField = None
+
+from mongoengine.fields import EmbeddedDocumentField, ListField, ReferenceField, GenericReferenceField
 from mongoengine.fields import DictField
 
 from cleancat import ValidationError as SchemaValidationError
-from flask.ext.mongorest import methods
-from flask.ext.mongorest.exceptions import ValidationError, UnknownFieldError
-from flask.ext.mongorest.utils import cmp_fields, isbound, isint, equal
+from flask_mongorest import methods
+from flask_mongorest.exceptions import ValidationError, UnknownFieldError
+from flask_mongorest.utils import cmp_fields, isbound, isint, equal
 
 
 class ResourceMeta(type):
     def __init__(cls, name, bases, classdict):
         if classdict.get('__metaclass__') is not ResourceMeta:
-            for document,resource in cls.child_document_resources.iteritems():
+            for document, resource in cls.child_document_resources.items():
                 if resource == name:
                     cls.child_document_resources[document] = cls
         type.__init__(cls, name, bases, classdict)
 
-
 class Resource(object):
-
     # MongoEngine Document class related to this resource (required)
     document = None
 
@@ -90,8 +98,6 @@ class Resource(object):
     # Must start and end with a "/"
     uri_prefix = None
 
-    __metaclass__ = ResourceMeta
-
     def __init__(self, view_method=None):
         """
         Initializes a resource. Optionally, a method class can be given to
@@ -104,7 +110,7 @@ class Resource(object):
         self._related_resources = self.get_related_resources()
         self._rename_fields = self.get_rename_fields()
         self._reverse_rename_fields = {}
-        for k, v in self._rename_fields.iteritems():
+        for k, v in self._rename_fields.items():
             self._reverse_rename_fields[v] = k
         assert len(self._rename_fields) == len(self._reverse_rename_fields), \
             'Cannot rename multiple fields to the same name'
@@ -159,7 +165,7 @@ class Resource(object):
                     raise ValidationError({'error': "Chunked Transfer-Encoding is not supported."})
 
                 try:
-                    self._raw_data = json.loads(request.data, parse_constant=self._enforce_strict_json)
+                    self._raw_data = json.loads(request.data.decode('utf-8'), parse_constant=self._enforce_strict_json)
                 except ValueError:
                     raise ValidationError({'error': 'The request contains invalid JSON.'})
                 if not isinstance(self._raw_data, dict):
@@ -296,7 +302,7 @@ class Resource(object):
         and hence use the Gte operator to filter the data.
         """
         filters = {}
-        for field, operators in getattr(self, 'filters', {}).iteritems():
+        for field, operators in getattr(self, 'filters', {}).items():
             field_filters = {}
             for op in operators:
                 if op.op == 'exact':
@@ -326,6 +332,110 @@ class Resource(object):
         else:
             return None
 
+    def get_field_value(self, obj, field_name, field_instance=None, **kwargs):
+        """Return a json-serializable field value.
+
+        field_name is the name of the field in `obj` to be serialized.
+        field_instance is a MongoEngine field definition.
+        **kwargs are just any options to be passed through to child resources serializers.
+        """
+        has_field_instance = bool(field_instance)
+        field_instance = (field_instance or
+                          self.document._fields.get(field_name, None) or
+                          getattr(self.document, field_name, None))
+
+        # Determine the field value
+        if has_field_instance:
+            field_value = obj
+        elif isinstance(obj, dict):
+            return obj[field_name]
+        else:
+            try:
+                field_value = getattr(obj, field_name)
+            except AttributeError:
+                raise UnknownFieldError
+
+        return self.serialize_field_value(obj, field_name, field_instance, field_value, **kwargs)
+
+    def serialize_field_value(self, obj, field_name, field_instance, field_value, **kwargs):
+        """Select and delegate to an appropriate serializer method based on type of field instance.
+
+        field_value is an actual value to be serialized.
+        For other fields, see get_field_value method.
+        """
+        if isinstance(field_instance, (ReferenceField, GenericReferenceField, EmbeddedDocumentField)):
+            return self.serialize_document_field(field_name, field_value, **kwargs)
+
+        elif isinstance(field_instance, ListField):
+            return self.serialize_list_field(field_instance, field_name, field_value, **kwargs)
+
+        elif isinstance(field_instance, DictField):
+            return self.serialize_dict_field(field_instance, field_name, field_value, **kwargs)
+
+        elif callable(field_instance):
+            return self.serialize_callable_field(obj, field_instance, field_name, field_value, **kwargs)
+        return field_value
+
+    def serialize_callable_field(self, obj, field_instance, field_name, field_value, **kwargs):
+        """Execute a callable field and return it or serialize
+        it based on its related resource defined in the `related_resources` map.
+        """
+        if isinstance(field_value, list):
+            value = field_value
+        else:
+            if isbound(field_instance):
+                value = field_instance()
+            elif isbound(field_value):
+                value = field_value()
+            else:
+                value = field_instance(obj)
+        if field_name in self._related_resources:
+            if isinstance(value, list):
+                return [self._related_resources[field_name]().serialize_field(o, **kwargs) for o in value]
+            elif value is None:
+                return None
+            else:
+                return self._related_resources[field_name]().serialize_field(value, **kwargs)
+        return value
+
+    def serialize_dict_field(self, field_instance, field_name, field_value, **kwargs):
+        """Serialize each value based on an explicit field type
+        (e.g. if the schema defines a DictField(IntField), where all
+        the values in the dict should be ints).
+        """
+        if field_instance.field:
+            return {
+                key: self.get_field_value(elem, field_name, field_instance=field_instance.field, **kwargs)
+                for (key, elem) in field_value.items()
+            }
+        # ... or simply return the dict intact, if the field type
+        # wasn't specified
+        else:
+            return field_value
+
+    def serialize_list_field(self, field_instance, field_name, field_value, **kwargs):
+        """Serialize each item in the list separately."""
+        return [val for val in [self.get_field_value(elem, field_name, field_instance=field_instance.field, **kwargs) for elem in field_value] if val]
+
+    def serialize_document_field(self, field_name, field_value, **kwargs):
+        """If this field is a reference or an embedded document, either return
+        a DBRef or serialize it using a resource found in `related_resources`.
+        """
+        if field_name in self._related_resources:
+            return (
+                field_value and
+                not isinstance(field_value, DBRef) and
+                self._related_resources[field_name]().serialize_field(field_value, **kwargs)
+            )
+        else:
+            if DocumentProxy and isinstance(field_value, DocumentProxy):
+                # Don't perform a DBRef isinstance check below since
+                # it might trigger an extra query.
+                return field_value.to_dbref()
+            if isinstance(field_value, DBRef):
+                return field_value
+            return field_value and field_value.to_dbref()
+
     def serialize(self, obj, **kwargs):
         """
         Given an object, serialize it, turning it into its JSON
@@ -339,89 +449,6 @@ class Resource(object):
         subresource = self._subresource(obj)
         if subresource:
             return subresource.serialize(obj, **kwargs)
-
-        def get(obj, field_name, field_instance=None):
-            """
-            @TODO needs significant cleanup
-            """
-
-            has_field_instance = bool(field_instance)
-            field_instance = (field_instance or
-                              self.document._fields.get(field_name, None) or
-                              getattr(self.document, field_name, None))
-
-            # Determine the field value
-            if has_field_instance:
-                field_value = obj
-            elif isinstance(obj, dict):
-                return obj[field_name]
-            else:
-                try:
-                    field_value = getattr(obj, field_name)
-                except AttributeError:
-                    raise UnknownFieldError
-
-            # If this field is a reference or an embedded document, either
-            # return a DBRef or serialize it using a resource found in
-            # `related_resources`.
-            if isinstance(field_instance, (ReferenceField, GenericReferenceField, EmbeddedDocumentField)):
-                if field_name in self._related_resources:
-                    return (
-                        field_value and
-                        not isinstance(field_value, DBRef) and
-                        self._related_resources[field_name]().serialize_field(field_value, **kwargs)
-                    )
-                else:
-                    if isinstance(field_value, DocumentProxy):
-                        # Don't perform a DBRef isinstance check below since
-                        # it might trigger an extra query.
-                        return field_value.to_dbref()
-                    if isinstance(field_value, DBRef):
-                        return field_value
-                    return field_value and field_value.to_dbref()
-
-            # If this field is a list, serialize each item in the list separately.
-            elif isinstance(field_instance, ListField):
-                return [val for val in [get(elem, field_name, field_instance=field_instance.field) for elem in field_value] if val]
-
-            # If this field is a dict...
-            elif isinstance(field_instance, DictField):
-                # ... serialize each value based on an explicit field type
-                # (e.g. if the schema defines a DictField(IntField), where all
-                # the values in the dict should be ints).
-                if field_instance.field:
-                    return {
-                        key: get(elem, field_name, field_instance=field_instance.field)
-                        for (key, elem) in field_value.iteritems()
-                    }
-                # ... or simply return the dict intact, if the field type
-                # wasn't specified
-                else:
-                    return field_value
-
-            # If this field is callable, execute it and return it or serialize
-            # it based on its related resource defined in the
-            # `related_resources` map.
-            elif callable(field_instance):
-                if isinstance(field_value, list):
-                    value = field_value
-                else:
-                    if isbound(field_instance):
-                        value = field_instance()
-                    elif isbound(field_value):
-                        value = field_value()
-                    else:
-                        value = field_instance(obj)
-
-                if field_name in self._related_resources:
-                    if isinstance(value, list):
-                        return [self._related_resources[field_name]().serialize_field(o, **kwargs) for o in value]
-                    elif value is None:
-                        return None
-                    else:
-                        return self._related_resources[field_name]().serialize_field(value, **kwargs)
-                return value
-            return field_value
 
         # Get the requested fields
         requested_fields = self.get_requested_fields(**kwargs)
@@ -452,14 +479,14 @@ class Resource(object):
                         value = related_resource.serialize_field(value)
                     elif isinstance(value, dict):
                         value = dict((k, related_resource.serialize_field(v))
-                                     for (k, v) in value.iteritems())
+                                     for (k, v) in value.items())
                     else:  # assume queryset or list
                         value = [related_resource.serialize_field(o)
                                  for o in value]
                 data[renamed_field] = value
             else:
                 try:
-                    data[renamed_field] = get(obj, field)
+                    data[renamed_field] = self.get_field_value(obj, field, **kwargs)
                 except UnknownFieldError:
                     try:
                         data[renamed_field] = self.value_for_field(obj, field)
@@ -509,13 +536,13 @@ class Resource(object):
         # E.g. if a -> b, b -> c, then a should never be renamed to c.
         fields_to_delete = []
         fields_to_update = {}
-        for k, v in self._rename_fields.iteritems():
+        for k, v in self._rename_fields.items():
             if v in self.data:
                 fields_to_update[k] = self.data[v]
                 fields_to_delete.append(v)
         for k in fields_to_delete:
             del self.data[k]
-        for k, v in fields_to_update.iteritems():
+        for k, v in fields_to_update.items():
             self.data[k] = v
 
         # If CleanCat schema exists on this resource, use it to perform the
@@ -578,7 +605,7 @@ class Resource(object):
         # above, and map the results to each object that references them.
         # TODO This is in dire need of refactoring, or a complete overhaul
         hints = {}
-        for field_name, q_obj in document_queryset.iteritems():
+        for field_name, q_obj in document_queryset.items():
             doc = self.get_related_resources()[field_name].document
 
             # Create a QuerySet based on the query object
@@ -606,7 +633,7 @@ class Resource(object):
                 for obj in document_queryset[field_name]:
                     hint_field_instance = obj._fields[hint_field]
                     # Don't trigger a query for SafeReferenceFields
-                    if isinstance(hint_field_instance, SafeReferenceField):
+                    if SafeReferenceField and isinstance(hint_field_instance, SafeReferenceField):
                         hinted = obj._db_data[hint_field]
                         if hint_field_instance.dbref:
                             hinted = hinted.id
@@ -622,7 +649,7 @@ class Resource(object):
         # Assign the results to each object
         # TODO This is in dire need of refactoring, or a complete overhaul
         for obj in objs:
-            for field_name, hint_index in hints.iteritems():
+            for field_name, hint_index in hints.items():
                 obj_id = obj.id
                 if isinstance(obj_id, DBRef):
                     obj_id = obj_id.id
@@ -642,7 +669,7 @@ class Resource(object):
         if params is None:
             params = self.params
 
-        for key, value in params.iteritems():
+        for key, value in params.items():
             # If this is a resource identified by a URI, we need
             # to extract the object id at this point since
             # MongoEngine only understands the object id
@@ -871,7 +898,7 @@ class Resource(object):
 
             # If we're comparing reference fields, only compare ids without
             # hitting the database
-            if isinstance(obj._fields.get(field), ReferenceField):
+            if hasattr(obj, '_db_data') and isinstance(obj._fields.get(field), ReferenceField):
                 db_val = obj._db_data.get(field)
                 id_from_obj = db_val and getattr(db_val, 'id', db_val)
                 id_from_data = value and getattr(value, 'pk', value)
@@ -891,3 +918,10 @@ class Resource(object):
     def delete_object(self, obj, parent_resources=None):
         obj.delete()
 
+
+# Py2/3 compatible way to do metaclasses (or six.add_metaclass)
+body = vars(Resource).copy()
+body.pop('__dict__', None)
+body.pop('__weakref__', None)
+
+Resource = ResourceMeta(Resource.__name__, Resource.__bases__, body)
